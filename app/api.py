@@ -123,8 +123,13 @@ def create_app(
             "the published head are served (minimum confirmations is "
             f"{settings.min_confirmations}). Reorgs and head rollbacks withdraw "
             "abandoned or insufficiently confirmed transfers, and a late round "
-            "can never overwrite a newer published revision. Progress and chain "
-            "view are persisted in SQLite, so a restart resumes following."
+            "can never overwrite a newer published revision. Shared status is "
+            "ordered by round start: a round that started earlier cannot "
+            "overwrite the outcome of a later-started round. A failure with an "
+            "existing view marks it degraded and records the error; publishing, "
+            "or re-reading the exact published revision/height/hash, restores "
+            "ok and clears the error. Progress and chain view are persisted in "
+            "SQLite, so a restart resumes following."
         ),
         lifespan=lifespan,
     )
@@ -149,6 +154,8 @@ def create_app(
                 "head_hash": state.head_hash,
                 "status": state.status,
                 "serving": state.has_view,
+                "round_counter": state.round_counter,
+                "last_result_seq": state.last_result_seq,
                 "last_error": state.last_error,
                 "last_error_at": state.last_error_at,
             },
@@ -171,6 +178,11 @@ def create_app(
             "published_at": state.published_at,
             "last_round_at": state.last_round_at,
             "rounds": state.rounds,
+            # Shared round-ordering bookkeeping: the sequence assigned to the
+            # most recently started round, and the start sequence of the round
+            # whose result is currently reflected in `status`.
+            "round_counter": state.round_counter,
+            "last_result_seq": state.last_result_seq,
             "last_error": state.last_error,
             "last_error_at": state.last_error_at,
             "min_confirmations": settings.min_confirmations,
@@ -338,6 +350,7 @@ DEMO_HTML = """<!doctype html>
   .pill { font-size:11px; padding:2px 7px; border-radius:999px;
           border:1px solid #2c3a4b; }
   .ok { background:#12341f; border-color:#2b6b3f; }
+  .warn { background:#3a2f12; border-color:#7a5f2a; }
   .bad { background:#3a1417; border-color:#7a2a30; }
   .withdrawn { color:#7a899c; text-decoration:line-through; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
@@ -439,14 +452,27 @@ function busy(btn, on) { if (btn) btn.disabled = on; }
 
 async function refresh() {
   try {
-    const h = await api('/health');
+    const [h, s] = await Promise.all([api('/health'), api('/chain/status')]);
     const v = h.chain_view;
     const pill = $('status');
-    pill.textContent = v.serving
-      ? `serving rev ${v.published_revision} · head ${v.head_height}`
-      : 'no view yet';
-    pill.className = 'pill ' + (v.serving ? 'ok' : 'bad');
-    $('view').textContent = JSON.stringify(v, null, 2);
+    if (!v.serving) {
+      pill.textContent = 'no view yet';
+    } else if (v.status === 'degraded') {
+      pill.textContent = `degraded · serving rev ${v.published_revision} · head ${v.head_height}`;
+    } else {
+      pill.textContent = `serving rev ${v.published_revision} · head ${v.head_height}`;
+    }
+    pill.className = 'pill ' + (!v.serving ? 'bad' : v.status === 'degraded' ? 'warn' : 'ok');
+    $('view').textContent = JSON.stringify({
+      chain_view: v,
+      ordering: {
+        round_counter: s.round_counter,
+        last_result_seq: s.last_result_seq,
+        last_error: s.last_error,
+        last_error_at: s.last_error_at,
+      },
+      lease: s.lease,
+    }, null, 2);
     const rounds = await api('/admin/rounds?limit=6');
     $('rounds').innerHTML = '<table><tr><th>round</th><th>inst</th><th>outcome</th>' +
       '<th>obs rev/h</th><th>anc</th><th>fetched/reused</th><th>ms</th></tr>' +

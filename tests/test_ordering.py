@@ -5,9 +5,11 @@ from __future__ import annotations
 import threading
 import time
 
+import httpx
+
 from app.db import BlockRecord, TransferRecord
 from app.ingest import Ingestor
-from app.source_client import ChainSourceClient
+from app.source_client import ChainSourceClient, SourceError
 from tests.conftest import Stack
 
 
@@ -234,3 +236,312 @@ def test_restart_during_partial_round_does_not_lose_or_refetch(synced: Stack):
     view = stack.api().get("/transfers", params={"address": "addr-alice"}).json()
     assert view["head_basis"]["height"] == 8
     assert [b["height"] for b in view["chain_view"]["blocks"]] == list(range(9))
+
+
+# ------------------------------------------------------- shared status ordering
+class OrderingSourceClient(ChainSourceClient):
+    """Wraps a real source client with a test-controlled head sequence.
+
+    The first head read is served from ``queue``; later reads defer to the
+    real source (unless ``always`` is set, which pins every read).  Blocks are
+    fetched for real.
+    """
+
+    def __init__(self, real: ChainSourceClient, queue=None, always=None):
+        self.real = real
+        self.queue = list(queue or [])
+        self.always = always
+        self.base_url = real.base_url
+
+    def get_head(self):
+        if self.always is not None:
+            return self.always
+        if self.queue:
+            return self.queue.pop(0)
+        return self.real.get_head()
+
+    def get_block(self, block_hash):
+        return self.real.get_block(block_hash)
+
+    def close(self):
+        return None
+
+
+def _head_tuple(client: httpx.Client) -> dict:
+    return client.get("/head").json()
+
+
+def _head_obj(payload: dict):
+    from app.db import ObservedHead
+
+    return ObservedHead(
+        revision=payload["revision"], height=payload["height"], hash=payload["hash"]
+    )
+
+
+def test_late_failure_after_newer_publish_cannot_degrade(synced: Stack):
+    """A slow round that started earlier must not overwrite a newer success.
+
+    Realistic shape: round A reads the head, stalls inside a block pull; round
+    B (started later) publishes a newer revision; round A's pull then fails.
+    Round A's failure is stale by start order and must be discarded, leaving
+    the newer successful status in place.
+    """
+    stack = synced
+    api = stack.api()
+    db = stack.api_servers[0].server.config.app.state.db
+    real_source = stack.api_servers[0].server.config.app.state.ingestor.source
+
+    # The source advances; A observes this head.
+    stack.source_client().post("/admin/advance", json={"count": 3})
+    head_a = _head_obj(_head_tuple(stack.source_client()))
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    class StallingClient(OrderingSourceClient):
+        def get_block(self, block_hash):
+            entered.set()
+            assert release.wait(10), "test did not release the stalled pull"
+            raise SourceError("simulated transient block pull failure")
+
+    slow = Ingestor(
+        db,
+        StallingClient(real_source, always=head_a),
+        instance_id="slow-round",
+        verify_head_after_round=False,
+    )
+    result: dict = {}
+
+    def run_slow():
+        result["report"] = slow.run_round().as_dict()
+
+    thread = threading.Thread(target=run_slow)
+    thread.start()
+    try:
+        assert entered.wait(10), "slow round never started pulling blocks"
+        # Round B starts after A and publishes an even newer revision.
+        stack.source_client().post("/admin/advance", json={"count": 2})
+        assert stack.api().post("/admin/sync").json()["outcome"] == "committed"
+        fresh = api.get("/transfers", params={"address": "addr-alice"}).json()
+        assert fresh["head_basis"]["height"] == 10
+        assert api.get("/chain/status").json()["status"] == "ok"
+
+        release.set()
+        thread.join(15)
+    finally:
+        release.set()
+        thread.join(15)
+
+    assert result["report"]["outcome"] == "failed"
+    status = api.get("/chain/status").json()
+    # Round A started earlier than the successful round B: its late failure
+    # cannot turn the newer success back into degraded.
+    assert status["status"] == "ok", status
+    assert status["last_error"] is None
+    assert status["head"]["height"] == 10
+    assert status["last_result_seq"] >= 1
+    after = api.get("/transfers", params={"address": "addr-alice"}).json()
+    assert after["chain_view"] == fresh["chain_view"]
+    assert after["head_basis"] == fresh["head_basis"]
+
+
+def test_failure_without_head_read_marks_degraded_and_recovery_clears_it(
+    synced: Stack,
+):
+    """A failing round that cannot read the head still degrades the shared view.
+
+    Once the source recovers, reading the *same* published revision/height/hash
+    clears the degraded status without republishing.
+    """
+    stack = synced
+    api = stack.api()
+    before = api.get("/chain/status").json()
+    assert before["status"] == "ok"
+
+    # The head endpoint fails before any head is observed.
+    stack.source_client().post("/admin/faults", json={"head_failures": 3})
+    report = stack.api().post("/admin/sync").json()
+    assert report["outcome"] == "failed"
+    assert report["observed_head"] is None
+
+    status = api.get("/chain/status").json()
+    assert status["status"] == "degraded"
+    assert status["serving"] is True
+    assert status["last_error"]
+    assert status["last_error_at"]
+    # The published view itself is untouched and still queryable.
+    view = api.get("/transfers", params={"address": "addr-alice"}).json()
+    assert view["head_basis"]["height"] == 5
+    assert view["chain_view"]["blocks"]
+
+    # Source recovers; the head is exactly the published one.
+    stack.source_client().post("/admin/faults", json={})
+    before_recovery = api.get("/transfers", params={"address": "addr-alice"}).json()
+    report = stack.api().post("/admin/sync").json()
+    assert report["outcome"] == "stale", report
+    assert report["published"] is False
+    status = api.get("/chain/status").json()
+    assert status["status"] == "ok"
+    assert status["last_error"] is None
+    assert status["last_error_at"] is None
+    # Same-head confirmation must not republish: the view, revision, head and
+    # original publication time are unchanged; only the round timestamp moves.
+    after = api.get("/transfers", params={"address": "addr-alice"}).json()
+    assert after["chain_view"] == before_recovery["chain_view"]
+    for key in ("revision", "height", "hash", "published_at"):
+        assert after["head_basis"][key] == before_recovery["head_basis"][key], key
+    assert status["head"]["height"] == 5
+
+    # A lower revision is still skipped (no resets of a newer published view).
+    stale = _head_tuple(stack.source_client())
+    stack.source_client().post("/admin/advance", json={"count": 2})
+    assert stack.api().post("/admin/sync").json()["outcome"] == "committed"
+    newer = api.get("/transfers", params={"address": "addr-alice"}).json()
+    db = stack.api_servers[0].server.config.app.state.db
+    real_source = stack.api_servers[0].server.config.app.state.ingestor.source
+    late = Ingestor(
+        db,
+        OrderingSourceClient(real_source, always=_head_obj(stale)),
+        instance_id="lower-revision",
+        verify_head_after_round=False,
+    )
+    report = late.run_round().as_dict()
+    assert report["outcome"] == "stale"
+    assert report["published"] is False
+    final = api.get("/transfers", params={"address": "addr-alice"}).json()
+    assert final["chain_view"] == newer["chain_view"]
+    assert final["head_basis"]["revision"] == newer["head_basis"]["revision"]
+
+
+def test_restart_keeps_shared_status_ordering_and_serves_address_queries(
+    synced: Stack,
+):
+    """Restarting an instance resumes ordering state and serves the view."""
+    stack = synced
+    stack.source_client().post("/admin/faults", json={"head_failures": 1})
+    assert stack.api().post("/admin/sync").json()["outcome"] == "failed"
+    degraded = stack.api().get("/chain/status").json()
+    assert degraded["status"] == "degraded"
+    seq_before = degraded["round_counter"]
+
+    stack.api_servers[0].stop()
+    stack.api_servers.clear()
+    stack.add_api("instance-after-restart")
+
+    resumed = stack.api().get("/chain/status").json()
+    assert resumed["round_counter"] >= seq_before
+    assert resumed["status"] == "degraded", "status was not persisted across restart"
+    assert resumed["last_error"]
+    # Address queries keep using the most recently published full view.
+    view = stack.api().get("/transfers", params={"address": "addr-alice"}).json()
+    assert view["head_basis"]["height"] == 5
+    assert [b["height"] for b in view["chain_view"]["blocks"]] == list(range(6))
+
+    # And the follower still pulls blocks and publishes normally.
+    stack.source_client().post("/admin/faults", json={})
+    stack.source_client().post("/admin/advance", json={"count": 2})
+    report = stack.api().post("/admin/sync").json()
+    assert report["outcome"] == "committed"
+    assert report["fetched_blocks"] == 2
+    recovered = stack.api().get("/chain/status").json()
+    assert recovered["status"] == "ok"
+    assert recovered["last_error"] is None
+
+
+def test_older_same_head_confirmation_does_not_clear_newer_degraded(
+    synced: Stack,
+):
+    """Ordering applies to recovery too: an earlier round cannot clear a newer
+    round's recorded failure.  A subsequently-started round still can."""
+    stack = synced
+    api = stack.api()
+    db = stack.api_servers[0].server.config.app.state.db
+    real_source = stack.api_servers[0].server.config.app.state.ingestor.source
+
+    # Round A reserves an early sequence number but has not finished.
+    early = Ingestor(
+        db,
+        OrderingSourceClient(
+            real_source, always=_head_obj(_head_tuple(stack.source_client()))
+        ),
+        instance_id="early-round",
+        verify_head_after_round=False,
+    )
+    early_report = early.run_round()
+
+    # A later round fails without a view change, recording degraded.
+    stack.source_client().post("/admin/faults", json={"head_failures": 1})
+    assert stack.api().post("/admin/sync").json()["outcome"] == "failed"
+    assert api.get("/chain/status").json()["status"] == "degraded"
+    stack.source_client().post("/admin/faults", json={})
+
+    # Force the same-head confirmation path with the early sequence number.
+    from app.ingest import RoundReport
+
+    report = RoundReport(
+        round_id="early-confirm",
+        instance_id="early-round",
+        outcome="",
+        round_seq=early_report.round_seq,
+    )
+    head = _head_obj(_head_tuple(stack.source_client()))
+    result = early._sync_to(head, report)
+    assert result.outcome == "superseded"
+    status = api.get("/chain/status").json()
+    assert status["status"] == "degraded"
+    assert status["last_error"]
+
+    # A later-started round observing the same head does clear it.
+    report2 = RoundReport(round_id="new-confirm", instance_id="x", outcome="")
+    report2.round_seq = db.begin_round()
+    result2 = early._sync_to(head, report2)
+    assert result2.outcome == "stale"
+    assert result2.published is False
+    status = api.get("/chain/status").json()
+    assert status["status"] == "ok"
+    assert status["last_error"] is None
+
+
+def test_schema_migration_adds_ordering_columns(tmp_path):
+    """A database created by an older build is upgraded in place on startup."""
+    import sqlite3
+
+    from app.db import Database
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE sync_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            published_revision INTEGER NOT NULL DEFAULT 0,
+            head_height INTEGER NOT NULL DEFAULT -1,
+            head_hash TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'empty',
+            published_at TEXT,
+            last_round_at TEXT,
+            last_error TEXT,
+            last_error_at TEXT,
+            rounds INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO sync_state (id, published_revision, head_height, head_hash,
+                                status, rounds)
+        VALUES (1, 7, 6, 'ab', 'ok', 3);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(str(path))
+    db.initialize()
+    state = db.get_state()
+    assert state.round_counter == 0
+    assert state.last_result_seq == 0
+    assert state.published_revision == 7
+    assert db.begin_round() == 1
+    assert db.begin_round() == 2
+
+    # The legacy view is still served.
+    snapshot = db.snapshot(address="addr-alice")
+    assert snapshot.state.head_height == 6

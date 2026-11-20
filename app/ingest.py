@@ -2,6 +2,10 @@
 
 Round contract
 --------------
+0. Reserve a ``round_seq`` from the shared ``sync_state`` **before** reading
+   the source.  It orders results across instances: a round that started
+   earlier can never overwrite the shared status recorded by a round that
+   started later.
 1. Read ``/head`` **once**; the resulting ``revision``/``height``/``hash`` is
    fixed for the whole round.  Every later request in the round uses only
    hashes, never a fresh head.
@@ -12,11 +16,15 @@ Round contract
    costs O(distance to the fork), not O(chain length), for a normal advance.
 3. Fetch only changed-suffix blocks that are not already in the immutable
    cache.  Abandoned-branch blocks stay cached and are reused if a branch
-   reappears.
+   reappears.  If the observed head is exactly the published revision, height
+   and hash, nothing is fetched or published; the status is re-confirmed as
+   ``ok`` and a previous error cleared.
 4. Publish the height -> hash view and the observed revision in one SQLite
    transaction.  That transaction refuses to overwrite a view whose published
    revision is already ``>=`` this round's revision, so a late slow round can
-   never clobber a newer one, even from a second instance.
+   never clobber a newer one, even from a second instance.  Failures write
+   ``degraded`` + the error (when a view exists) only if no later-started round
+   has already recorded its result.
 
 Nothing is published unless every step above succeeded.
 """
@@ -48,6 +56,7 @@ class RoundReport:
     round_id: str
     instance_id: str
     outcome: str
+    round_seq: int | None = None
     observed: ObservedHead | None = None
     ancestor_height: int | None = None
     ancestor_hash: str | None = None
@@ -66,6 +75,7 @@ class RoundReport:
             "round_id": self.round_id,
             "instance_id": self.instance_id,
             "outcome": self.outcome,
+            "round_seq": self.round_seq,
             "observed_head": {
                 "revision": self.observed.revision,
                 "height": self.observed.height,
@@ -203,6 +213,11 @@ class Ingestor:
         )
         observed: ObservedHead | None = None
         try:
+            # Ordering is claimed when the round starts, before the first
+            # network call.  Shared SQLite state only accepts a result from a
+            # round that started no earlier than the round whose result is
+            # already recorded.
+            report.round_seq = self.db.begin_round()
             self.db.renew_lease(self.instance_id, self.lease_seconds)
             observed = self.source.get_head()
             report.observed = observed
@@ -229,25 +244,38 @@ class Ingestor:
                 self.state["rounds_committed"] += 1
                 self.state["last_success_at"] = utcnow()
                 self.state["last_error"] = None
-            else:
+            elif result.outcome == "superseded":
                 self.state["rounds_stale"] += 1
                 report.notes.append(
-                    "a revision at least as new as this round was already "
-                    "published; nothing was overwritten"
+                    "a round that started later already recorded the shared "
+                    "status; this earlier-started result was not applied"
                 )
+            else:
+                self.state["rounds_stale"] += 1
+                if result.published_revision == observed.revision:
+                    report.notes.append(
+                        "head matches the published revision, height and hash; "
+                        "status was re-confirmed without republishing"
+                    )
+                    self.state["last_error"] = None
+                else:
+                    report.notes.append(
+                        "a revision at least as new as this round was already "
+                        "published; nothing was overwritten"
+                    )
         except SourceError as exc:
             report.error = str(exc)
             report.outcome = "failed"
             self.state["rounds_failed"] += 1
             self.state["last_error"] = str(exc)
-            self._record_failure(str(exc), observed)
+            self._record_failure(str(exc), observed, report.round_seq)
         except Exception as exc:
             report.error = f"{type(exc).__name__}: {exc}"
             report.outcome = "failed"
             self.state["rounds_failed"] += 1
             self.state["last_error"] = report.error
             log.exception("unexpected ingest failure")
-            self._record_failure(report.error, observed)
+            self._record_failure(report.error, observed, report.round_seq)
         finally:
             report.duration_ms = int((time.monotonic() - started) * 1000)
             if report.outcome != "failed":
@@ -256,9 +284,19 @@ class Ingestor:
             self.state["current_round_id"] = None
         return report
 
-    def _record_failure(self, error: str, observed: ObservedHead | None) -> None:
+    def _record_failure(
+        self, error: str, observed: ObservedHead | None, round_seq: int | None
+    ) -> None:
         try:
-            self.db.record_failure(error[:2000])
+            # Recorded even when this round never read a head: with an existing
+            # view the shared status must show degraded + the error.
+            applied = self.db.record_failure(error[:2000], round_seq=round_seq)
+            if not applied:
+                log.info(
+                    "failure from round seq %s ignored: a later-started round "
+                    "already recorded its outcome",
+                    round_seq,
+                )
         except Exception:
             log.exception("could not record failure state")
         try:
@@ -299,8 +337,28 @@ class Ingestor:
         published = self.db.get_state()
         has_view = published.has_view
 
-        # Revision guard (also re-checked atomically inside commit_view).
-        if has_view and published.published_revision >= observed.revision:
+        # Revision guard (also re-checked atomically inside commit_view).  A
+        # lower revision is skipped, never republished.
+        if has_view and published.published_revision > observed.revision:
+            return CommitResult(
+                published=False,
+                outcome="stale",
+                previous_head_height=published.head_height,
+                published_revision=published.published_revision,
+            )
+        if has_view and published.published_revision == observed.revision:
+            if (
+                published.head_height == observed.height
+                and published.head_hash == observed.hash
+            ):
+                # The source reports exactly the published revision, height and
+                # hash: nothing to fetch or republish, but this is the recovery
+                # signal that clears a degraded status and its error.
+                return self.db.confirm_published_head(
+                    observed, round_seq=report.round_seq
+                )
+            # Same revision but a different head: the published view is the
+            # newer one and must not be overwritten.
             return CommitResult(
                 published=False,
                 outcome="stale",
@@ -338,7 +396,11 @@ class Ingestor:
                 raise SourceError("full publish does not reach genesis")
 
         return self.db.commit_view(
-            observed, suffix_desc, ancestor_height, ancestor_hash
+            observed,
+            suffix_desc,
+            ancestor_height,
+            ancestor_hash,
+            round_seq=report.round_seq,
         )
 
     def _collect_suffix_to_genesis(

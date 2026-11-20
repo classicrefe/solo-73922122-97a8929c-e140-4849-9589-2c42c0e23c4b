@@ -91,6 +91,8 @@ class PublishedState:
     last_error: str | None
     last_error_at: str | None
     rounds: int
+    round_counter: int = 0
+    last_result_seq: int = 0
 
     @property
     def has_view(self) -> bool:
@@ -160,7 +162,13 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_round_at TEXT,
     last_error TEXT,
     last_error_at TEXT,
-    rounds INTEGER NOT NULL DEFAULT 0
+    rounds INTEGER NOT NULL DEFAULT 0,
+    -- Round ordering across instances: every round takes a sequence number when
+    -- it starts; only a result at least as new as the last applied one may
+    -- write shared status.  This keeps a slow round that started earlier from
+    -- overwriting a later round's completed outcome.
+    round_counter INTEGER NOT NULL DEFAULT 0,
+    last_result_seq INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO sync_state (id) VALUES (1);
 
@@ -244,6 +252,7 @@ class Database:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.executescript(SCHEMA)
+                self._migrate(conn)
                 return
             except sqlite3.OperationalError as exc:  # lock contention at boot
                 last_error = exc
@@ -252,6 +261,30 @@ class Database:
                 conn.close()
         assert last_error is not None
         raise last_error
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add round-ordering columns to databases created by older builds.
+
+        Both replicas may start at once against the same file; ``ADD COLUMN``
+        is idempotent in effect, so a duplicate-column error from the other
+        replica is ignored.
+        """
+        columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(sync_state)")
+        }
+        additions = {
+            "round_counter": "INTEGER NOT NULL DEFAULT 0",
+            "last_result_seq": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, declaration in additions.items():
+            if name in columns:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE sync_state ADD COLUMN {name} {declaration}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
     # --------------------------------------------------------------- block cache
     @staticmethod
@@ -384,25 +417,107 @@ class Database:
             last_error=row["last_error"],
             last_error_at=row["last_error_at"],
             rounds=int(row["rounds"]),
+            round_counter=int(row["round_counter"]),
+            last_result_seq=int(row["last_result_seq"]),
         )
 
     def get_state(self) -> PublishedState:
         with self._read() as conn:
             return self._state_row(conn)
 
+    def begin_round(self) -> int:
+        """Reserve a globally ordered sequence number for a round's start.
+
+        Sequence numbers are shared by every instance through ``sync_state``,
+        so "started earlier" is well defined even when the replicas never talk
+        to each other.
+        """
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE sync_state SET round_counter = round_counter + 1 WHERE id = 1"
+            )
+            row = conn.execute(
+                "SELECT round_counter FROM sync_state WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("sync_state row missing")
+            return int(row["round_counter"])
+
     # ------------------------------------------------------------------- commit
+    @staticmethod
+    def _mark_result(conn: sqlite3.Connection, round_seq: int | None) -> None:
+        """Remember the start sequence of the round whose outcome is applied."""
+        if round_seq is not None:
+            conn.execute(
+                "UPDATE sync_state SET last_result_seq = MAX(last_result_seq, ?) "
+                "WHERE id = 1",
+                (round_seq,),
+            )
+
+    def confirm_published_head(
+        self, observed: ObservedHead, *, round_seq: int | None = None
+    ) -> CommitResult:
+        """Re-confirm an unchanged head without republishing anything.
+
+        Used when the source reports exactly the published revision, height and
+        hash.  It is the recovery signal: a degraded status and its recorded
+        error are cleared even though nothing is re-published (``published_at``
+        and the view stay untouched).  A lower revision is still skipped.
+        """
+        with self._write() as conn:
+            state = self._state_row(conn)
+            if (
+                not state.has_view
+                or state.published_revision != observed.revision
+                or state.head_height != observed.height
+                or state.head_hash != observed.hash
+            ):
+                return CommitResult(
+                    published=False,
+                    outcome="stale",
+                    previous_head_height=state.head_height if state.has_view else None,
+                    published_revision=state.published_revision,
+                )
+            if round_seq is not None and round_seq < state.last_result_seq:
+                # A round that started before the one whose result is recorded
+                # may not clear that newer outcome; the next round will.
+                return CommitResult(
+                    published=False,
+                    outcome="superseded",
+                    previous_head_height=state.head_height,
+                    published_revision=state.published_revision,
+                )
+            self._mark_result(conn, round_seq)
+            conn.execute(
+                "UPDATE sync_state SET status = 'ok', last_round_at = ?, "
+                "last_error = NULL, last_error_at = NULL WHERE id = 1",
+                (utcnow(),),
+            )
+            return CommitResult(
+                published=False,
+                outcome="stale",
+                previous_head_height=state.head_height,
+                published_revision=state.published_revision,
+            )
+
     def commit_view(
         self,
         observed: ObservedHead,
         suffix_desc: list[BlockRecord],
         ancestor_height: int | None,
         ancestor_hash: str | None,
+        *,
+        round_seq: int | None = None,
     ) -> CommitResult:
         """Atomically publish a chain view for ``observed``.
 
         ``suffix_desc`` contains only changed-suffix blocks, ordered from the
         observed head downwards.  The caller guarantees the list links back to
-        the common ancestor.  The revision guard rejects late rounds.
+        the common ancestor.  The revision guard rejects late views: a round
+        whose observed revision is not newer than the published one is stale.
+        A genuinely newer view is always published (the view is monotonic) and
+        the round's start sequence is recorded, so a failure from an
+        earlier-started round cannot later mark this success degraded.
         """
         if ancestor_height is None and (not suffix_desc or suffix_desc[-1].height != 0):
             raise ValueError("full-chain publish must end at genesis")
@@ -427,6 +542,8 @@ class Database:
                 and ancestor_hash == observed.hash
                 and state.head_height == observed.height
             )
+            previous_height = state.head_height if state.has_view else None
+            self._mark_result(conn, round_seq)
             if same_head:
                 conn.execute(
                     "UPDATE sync_state SET "
@@ -517,14 +634,23 @@ class Database:
             )
 
     # -------------------------------------------------------------- failures/log
-    def record_failure(self, error: str) -> None:
+    def record_failure(self, error: str, *, round_seq: int | None = None) -> bool:
         """Record a failed round without touching the published view.
 
         Status becomes ``degraded`` when a view is still being served (so the
         head did not move) and stays ``empty`` before the first publish.
+
+        A failure is recorded regardless of whether this round managed to read
+        the head: an existing view is always marked degraded so operators can
+        see that the follow is behind.  Returns False (and changes nothing)
+        when a round that started later already recorded its outcome, so a late
+        failure cannot turn a newer success back into degraded.
         """
         with self._write() as conn:
             state = self._state_row(conn)
+            if round_seq is not None and round_seq < state.last_result_seq:
+                return False
+            self._mark_result(conn, round_seq)
             conn.execute(
                 "UPDATE sync_state SET status = ?, last_error = ?, "
                 "last_error_at = ? WHERE id = 1",
@@ -534,6 +660,7 @@ class Database:
                     utcnow(),
                 ),
             )
+            return True
 
     def log_round(
         self,

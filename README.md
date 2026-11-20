@@ -46,20 +46,34 @@ curl -X POST http://localhost:9100/admin/rollback \
   -H 'content-type: application/json' -d '{"to_height":3}'
 curl -X POST http://localhost:8000/admin/sync
 
-# simulate source failures: the published view stays served
+# simulate source failures: the published view stays served, status degrades
 curl -X POST http://localhost:9100/admin/faults \
   -H 'content-type: application/json' -d '{"head_failures":2,"block_failures":2}'
 curl -X POST http://localhost:8000/admin/sync
+curl http://localhost:8000/chain/status      # status=degraded, last_error set
+curl 'http://localhost:8001/transfers?address=addr-alice'   # replica B still serves
+
+# recovery: clear the faults; reading the unchanged head restores ok without
+# republishing (published_at and the view stay the same)
 curl -X POST http://localhost:9100/admin/faults \
   -H 'content-type: application/json' -d '{}'
+curl -X POST http://localhost:8000/admin/sync   # outcome=stale, but status=ok
+curl http://localhost:8000/chain/status         # status=ok, last_error=null
 ```
+
+Watch both replicas at once (`:8000/docs` and `:8001/docs`, or the consoles at
+`/`): a round started on A that is still pulling blocks when B publishes a
+newer head can fail late without turning B's `ok` back into `degraded` —
+`/chain/status` exposes `round_counter` (last start sequence) and
+`last_result_seq` (start sequence of the applied result) so the ordering is
+visible. `docker compose logs -f api-a api-b` shows each attempt.
 
 Local (no Docker), Python 3.11+:
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest -q                      # 25 end-to-end tests
+pytest -q                      # 30 end-to-end tests
 
 # terminals 1-3
 SOURCE_STATE_PATH=/tmp/chain-source.json INITIAL_BLOCKS=6 \
@@ -93,10 +107,30 @@ DB_PATH=/tmp/chain.db CHAIN_SOURCE_URL=http://127.0.0.1:9100 INSTANCE_ID=api-b \
   once per round. `commit_view` runs in one SQLite `BEGIN IMMEDIATE`
   transaction that compares the target revision against `published_revision`
   and refuses (`stale`) when a revision at least as new is already published.
-* **Failures keep the published view.** Blocks are fetched into an immutable
-  cache first; the published view and progress only change in the final commit.
-  Any head/block/validation error leaves the previous view intact and the
-  error recorded on `/chain/status` and `/admin/rounds`.
+* **Shared status is ordered by round start.** Every round reserves a
+  monotonic `round_counter` value in `sync_state` **before** its first source
+  request, and records `last_result_seq` when its outcome is applied. A failure
+  from a round that started before the round whose result is already recorded
+  is discarded instead of overwriting it — so when instance A is still in a
+  slow block pull while instance B has already published a newer head, A's
+  late failure cannot turn B's `ok` back into `degraded`. Both sequence
+  numbers are exposed on `/chain/status`. Successful publishes remain
+  revision-guarded only, since the revision guard alone keeps the view
+  monotonic.
+* **Failures keep the published view, and surface.** Blocks are fetched into an
+  immutable cache first; the published view and progress only change in the
+  final commit. Any head/block/validation error leaves the previous view intact
+  and, if a view exists, records `status=degraded` plus `last_error` /
+  `last_error_at` on `/chain/status` and `/admin/rounds` — **even when the
+  round never managed to read the head**. Before the first publish the status
+  stays `empty`.
+* **Recovery restores `ok`.** A successful publish clears the error and sets
+  `ok`. So does a round whose head read is exactly the published revision,
+  height and hash: it is a same-head re-confirmation, so nothing is
+  re-published (`published_at` and the view are untouched) and a lower
+  revision is still skipped as `stale`. This is what clears a lingering
+  `degraded` after a transient source outage once the source is back on the
+  already-published head.
 * **No refetch of the known prefix.** The follower walks the two heads down
   `parent_hash` to the common ancestor, cache first. Only changed-suffix blocks
   are fetched; abandoned branches stay cached and are reused if a branch
@@ -105,11 +139,17 @@ DB_PATH=/tmp/chain.db CHAIN_SOURCE_URL=http://127.0.0.1:9100 INSTANCE_ID=api-b \
   functions (threadpool), and the follower runs in its own thread on its own
   SQLite connections. A delayed source only delays the next commit.
 * **Persisted view + progress, restart-safe.** `sync_state` (published revision,
-  head, status, errors) and `chain_blocks` are written together in the same
-  transaction. On restart the follower continues from the persisted head.
+  head, status, errors, round-counter/last-result ordering) and
+  `chain_blocks` are written together in the same transaction. On restart the
+  follower continues from the persisted head with the same ordering state, and
+  address queries keep serving the most recently published complete view
+  while blocks are pulled normally. Older databases are migrated in place
+  (`round_counter`/`last_result_seq` columns are added on startup).
 * **Two instances, one view.** Both replicas may run the follower. A SQLite
-  lease (renewed during long rounds) elects one active follower at a time, and
-  the revision guard makes concurrent rounds safe regardless of the lease.
+  lease (renewed during long rounds) elects one active follower at a time; the
+  revision guard keeps the view monotonic and the round-start ordering keeps
+  either replica's late failure from overwriting the other's newer status, even
+  when both rounds overlap.
 
 ## API
 
@@ -153,13 +193,14 @@ A transfer is `{txid, from_address, to_address, amount}` with an integer
 * `blocks` / `block_transfers` — immutable by-hash cache of every block ever
   fetched, including abandoned branches.
 * `chain_blocks` — the published canonical height→hash view.
-* `sync_state` — published revision, head, status, last round/error, round count.
+* `sync_state` — published revision, head, status, last round/error, round count,
+  and the round-start ordering counters (`round_counter`, `last_result_seq`).
 * `ingest_lease` — one active follower across instances.
 * `ingest_rounds` — bounded audit trail (last 500 rounds).
 
 ## Verified behaviour (tests)
 
-`pytest` runs 25 end-to-end tests against real HTTP servers on ephemeral
+`pytest` runs 30 end-to-end tests against real HTTP servers on ephemeral
 ports and a real SQLite file. They cover: the two-block confirmation cutoff and
 that it cannot be lowered; every address seeing the identical complete view;
 reorg suffix-only update with no common-prefix refetch (asserted from
@@ -170,6 +211,25 @@ late rounds rejected after a newer publish; two instances converging from a
 shared volume; restart resuming without refetching; crash-cached blocks reused;
 same-head revision bumps; source state persistence; and `/docs`/console
 availability.
+
+The shared-status regressions have dedicated tests:
+
+* a round that started earlier, stalled in a block pull and *then* failed after
+  a later-started round published a newer head does not degrade the shared
+  status or alter either view;
+* a failing round that could not read the head at all still marks an existing
+  view `degraded` with `last_error`, while queries keep serving the previous
+  complete view;
+* the source returning the exact published revision/height/hash clears
+  `degraded` and the error without republishing (view, revision and
+  `published_at` unchanged), and a lower revision is still skipped;
+* a restart keeps the persisted ordering counters and degraded status, still
+  answers address queries from the published view, and the same process then
+  fetches and publishes new blocks normally;
+* an earlier-started same-head confirmation cannot clear a later round's
+  recorded failure, while a later-started confirmation can;
+* a database created by the previous schema is migrated in place (ordering
+  columns added, existing view still served).
 
 ## Known limits
 
@@ -195,12 +255,14 @@ availability.
 
 | Check | Result |
 | --- | --- |
-| `pytest` (25 end-to-end tests, real HTTP servers + real SQLite file) | pass, against both the local environment and the exact pinned Docker dependency set (`PYTHONPATH=/tmp/pins`) |
-| Both ASGI apps under Uvicorn with pinned deps (`chain_source.main:app`, `app.main:app`) | started, served `/health`, `/docs`, `/`, queries, followed source advances and a fork over real sockets |
+| `pytest` (30 end-to-end tests, real HTTP servers + real SQLite file) | pass (5 consecutive full runs) |
+| The three new shared-status regression tests against the pre-fix code | fail as expected (`degraded` overwrote `ok` / late failure applied); pass after the fix |
+| Both ASGI apps under Uvicorn with the pinned dependencies (`chain_source.main:app`, `app.main:app`) | started, served `/health`, `/docs`, `/`, followed source advances, forks and faults over real sockets |
 | Two instances sharing one SQLite file | identical `/chain/blocks` views; only one held the lease; failed instance kept serving |
+| Live double-instance ordering check | a delayed round on A started first, B published a newer head, A's late round did not overwrite it; both views identical afterwards |
+| Live failure/recovery check | `head_failures` with no head read → `status=degraded` + error, replica B still served; faults cleared → same-head round `outcome=stale`, `status=ok`, `published_at` unchanged |
 | Restart continuation | persisted view served before any round; subsequent rounds fetched only new blocks (per-hash counters on the source unchanged for known blocks) |
-| `ruff check` / `ruff format` | clean |
-| `docker compose up --build` | **not executed** — no Docker daemon in this environment |
+| `docker compose up --build` | **not executed** — no Docker daemon in this environment; Compose/Dockerfiles reviewed only |
 
 Not implemented / out of scope: authentication and rate limiting on the API and
 demo console, a real chain node adapter, cross-host replica coordination,
